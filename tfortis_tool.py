@@ -15,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from scapy.all import ARP, Ether, srp
+import subprocess
+import platform
 
 # ——— Настройки ———
 SWITCH_USERNAME = 'admin'
@@ -34,14 +36,27 @@ PORT_RANGE = range(0, 6)  # 0–5
 TEMP_IP_START = '10.125.41.220'
 TEMP_IP_END = '10.125.41.230'
 
+# Дополнительные параметры
+PING_COUNT = 1
+REQUEST_TIMEOUT = 20
+SLEEP_BETWEEN_PORTS = 2
+MAX_WORKERS = 20
+ARP_TIMEOUT = 2
+RETRY_DELAY = 5
+
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 def arp_scan(network):
     logger.info(f"Начинаю ARP-сканирование сети {network}...")
     try:
-        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=str(network)), timeout=2, verbose=0)
+        ans, _ = srp(
+            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(network)),
+            timeout=ARP_TIMEOUT,
+            verbose=0,
+        )
     except PermissionError:
+        logger.error("Требуются привилегии root для ARP-сканирования")
         sys.exit(1)
     result = []
     for sent, received in ans:
@@ -49,14 +64,21 @@ def arp_scan(network):
     logger.info(f"ARP-сканирование завершено, найдено {len(result)} устройств.")
     return result
 
-def get_switch_mac(ip: str, port: int, attempts: int = 2, delay: float = 5.0) -> Optional[str]:
+def get_switch_mac(ip: str, port: int, attempts: int = 2, delay: float = RETRY_DELAY) -> Optional[str]:
     """
     Пытается получить MAC с порта коммутатора до 'attempts' раз с паузой delay секунд.
     """
+    if not ping_host(ip):
+        logger.warning("%s недоступен", ip)
+        return None
     url = f'http://{ip}/api/getPortMacList?port={port}'
     for attempt in range(attempts):
         try:
-            resp = requests.get(url, auth=HTTPDigestAuth(SWITCH_USERNAME, SWITCH_PASSWORD), timeout=30)
+            resp = requests.get(
+                url,
+                auth=HTTPDigestAuth(SWITCH_USERNAME, SWITCH_PASSWORD),
+                timeout=REQUEST_TIMEOUT,
+            )
             resp.raise_for_status()
             text = resp.text.strip()
             try:
@@ -73,30 +95,55 @@ def get_switch_mac(ip: str, port: int, attempts: int = 2, delay: float = 5.0) ->
                 return v.upper().replace(':', '').replace('-', '')
         except Exception as e:
             if attempt < attempts - 1:
-                logger.warning(f"Попытка {attempt+1} неудачна для {ip}:{port}, пробую ещё раз...")
+                logger.warning(
+                    "Попытка %d неудачна для %s:%s: %s", attempt + 1, ip, port, e
+                )
                 time.sleep(delay)
             else:
-                logger.error(f"Ошибка получения MAC {ip} порт {port} после {attempts} попыток: {e}")
+                logger.error(
+                    "Ошибка получения MAC %s порт %s после %d попыток: %s",
+                    ip,
+                    port,
+                    attempts,
+                    e,
+                )
     return None
 
 
 def load_cache(sheet: str) -> pd.DataFrame:
     try:
         return pd.read_excel(EXCEL_FILE, sheet_name=sheet, dtype=str)
-    except:
+    except FileNotFoundError:
+        logger.warning("Файл %s не найден", EXCEL_FILE)
+        return pd.DataFrame()
+    except Exception as exc:
+        logger.error("Ошибка чтения листа %s: %s", sheet, exc)
         return pd.DataFrame()
 
 def now():
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+
+def ping_host(ip: str) -> bool:
+    param = '-n' if platform.system().lower().startswith('win') else '-c'
+    result = subprocess.run(
+        ['ping', param, str(PING_COUNT), ip],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
 def collect_switch_ports(sw):
     """Опрашивает все порты одного коммутатора (последовательно), возвращает список записей"""
     recs = []
+    if not ping_host(sw):
+        logger.warning("%s не отвечает на ping", sw)
+        return recs
     for port in PORT_RANGE:
         mac = get_switch_mac(sw, port)
         if mac:
             recs.append({'Switch IP': sw, 'Port': str(port), 'MAC': mac, 'LastChecked': now()})
-        time.sleep(10)
+        time.sleep(SLEEP_BETWEEN_PORTS)
     return recs
 
 def backup_excel():
@@ -113,7 +160,12 @@ def set_camera_ip(ip: str, new_ip: str, mask: str, gw: str) -> bool:
         'Network.eth0.DefaultGateway': gw,
     }
     try:
-        resp = requests.get(url, params=params, auth=HTTPDigestAuth(CAMERA_USERNAME, CAMERA_PASSWORD), timeout=20)
+        resp = requests.get(
+            url,
+            params=params,
+            auth=HTTPDigestAuth(CAMERA_USERNAME, CAMERA_PASSWORD),
+            timeout=REQUEST_TIMEOUT,
+        )
         resp.raise_for_status()
         if "OK" in resp.text.upper() or "<response>OK</response>" in resp.text.upper():
             logger.info(f"IP камеры {ip} меняется на {new_ip} (успешно)")
@@ -277,7 +329,7 @@ def main():
         logger.info("Обновляем кэш портов коммутаторов (многопоточно)...")
         switches = df_map['Switch IP'].dropna().unique().tolist()
         port_records = []
-        with ThreadPoolExecutor(max_workers=50) as pool:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {pool.submit(collect_switch_ports, sw): sw for sw in switches}
             for fut in concurrent.futures.as_completed(futures):
                 sw = futures[fut]
